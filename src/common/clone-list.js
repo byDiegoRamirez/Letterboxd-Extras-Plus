@@ -39,50 +39,90 @@
 	// ======================================================================
 
 	function initListPage(listUrl) {
+		console.log(LOG_PREFIX, 'Clone list loaded for', listUrl);
 		addStyles();
 
-		// The sidebar can be rendered late, so retry for a little while
+		// The sidebar can be rendered late, so retry for a little while before using a fallback spot
 		let attempts = 0;
 		const tryAdd = () => {
 			if (document.querySelector('.lbxp-clone-button') != null) return;
-			if (addCloneButton(listUrl)) return;
-			if (++attempts < 20) setTimeout(tryAdd, 500);
+			if (addCloneButton(listUrl, false)) return;
+			if (++attempts < 10) {
+				setTimeout(tryAdd, 500);
+			} else {
+				addCloneButton(listUrl, true);
+			}
 		};
 		tryAdd();
 	}
 
 	function findLetterboxdCloneLink() {
 		const candidates = document.querySelectorAll('a, button');
+		let best = null;
 		for (const el of candidates) {
-			if (/^\s*clone\s+this\s+list\s*$/i.test(el.textContent)) return el;
+			if (el.closest('.lbxp-clone-item, .lbxp-clone-button')) continue;
+			const text = el.textContent.trim();
+			const href = el.getAttribute('href') || '';
+			if (el.closest('.poster-list, .film-list, .list-set')) continue; // films/lists that happen to be named "Clone"
+			const isClone = (/\bclone\b/i.test(text) && text.length < 40)
+				|| /\/list\/new\/?\?.*(copy|clone)/i.test(href)
+				|| /\/list\/[^\/]+\/clone\/?$/i.test(href);
+			// Prefer the shortest matching element (the link itself, not a wrapper)
+			if (isClone && (best == null || text.length < best.textContent.trim().length)) best = el;
 		}
-		return null;
+		return best;
 	}
 
-	function addCloneButton(listUrl) {
-		const cloneLink = findLetterboxdCloneLink();
-		if (cloneLink == null) return false;
-
+	function createCloneButton(listUrl, className) {
 		const button = document.createElement('a');
 		button.href = '#';
-		button.className = cloneLink.className + ' lbxp-clone-button';
+		button.className = className + ' lbxp-clone-button';
 		button.textContent = 'Clone with Letterboxd Extras +';
 		button.title = 'Copy every film in this list into a new list of your own';
 		button.addEventListener('click', event => {
 			event.preventDefault();
 			startClone(listUrl, button);
 		});
+		return button;
+	}
 
+	function insertAfter(anchor, button) {
 		// Letterboxd's actions panel is a <ul> of <li>, so mirror that structure if present
-		const parentLi = cloneLink.closest('li');
+		const parentLi = anchor.closest('li');
 		if (parentLi != null) {
 			const li = document.createElement('li');
 			li.className = parentLi.className + ' lbxp-clone-item';
 			li.append(button);
 			parentLi.after(li);
 		} else {
-			cloneLink.after(button);
+			anchor.after(button);
 		}
+	}
+
+	function addCloneButton(listUrl, useFallback) {
+		const cloneLink = findLetterboxdCloneLink();
+		if (cloneLink != null) {
+			insertAfter(cloneLink, createCloneButton(listUrl, cloneLink.className));
+			console.log(LOG_PREFIX, 'Button added under', cloneLink);
+			return true;
+		}
+		if (!useFallback) return false;
+
+		// No "Clone this list" found (markup changed, or not logged in): use the sidebar actions panel
+		const panel = document.querySelector('.actions-panel ul, .js-actions-panel, aside .actions-panel');
+		if (panel != null) {
+			const li = document.createElement('li');
+			li.className = 'lbxp-clone-item';
+			li.append(createCloneButton(listUrl, ''));
+			panel.append(li);
+			console.log(LOG_PREFIX, 'Clone link not found, button added to actions panel');
+			return true;
+		}
+
+		// Last resort: a floating button, so the feature is always reachable
+		const floating = createCloneButton(listUrl, 'lbxp-floating');
+		document.body.append(floating);
+		console.log(LOG_PREFIX, 'Clone link and actions panel not found, using floating button');
 		return true;
 	}
 
@@ -426,6 +466,11 @@
 		style.id = 'lbxp-clone-styles';
 		style.textContent = `
 			.lbxp-clone-button[data-busy="true"] { cursor: progress; opacity: 0.8; }
+			.lbxp-clone-button.lbxp-floating {
+				position: fixed; right: 16px; bottom: 16px; z-index: 100000;
+				padding: 10px 14px; border-radius: 4px; background: #00c030; color: #fff !important;
+				font-weight: bold; font-size: 13px; text-decoration: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+			}
 			.lbxp-banner {
 				position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
 				z-index: 100000; max-width: min(640px, calc(100vw - 32px));
