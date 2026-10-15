@@ -86,6 +86,18 @@ browser.runtime.onMessage.addListener((msg, sender, response) => {
             return permissions;
         })();
 
+    } else if (msg.name == "OPENTAB") { // Open a Letterboxd page in a new tab (used by Clone with Letterboxd Extras +)
+        if (typeof msg.url !== "string" || !msg.url.startsWith("https://letterboxd.com/")) {
+            response({ ok: false });
+            return true;
+        }
+        browser.tabs.create({ url: msg.url, index: sender.tab ? sender.tab.index + 1 : undefined })
+            .then(() => response({ ok: true }))
+            .catch((err) => {
+                console.error("Failed to open tab:", err);
+                response({ ok: false });
+            });
+
     } else if (msg.name == "GETDEFAULTRATINGSORDER") {
         (async () => {
             var ratingsOrder = getDefaultRatingsOrder();

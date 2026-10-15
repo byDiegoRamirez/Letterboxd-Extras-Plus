@@ -1,0 +1,445 @@
+/* Letterboxd Extras + | Clone list
+ *
+ * 1. On a list page (letterboxd.com/{user}/list/{slug}/), adds a "Clone with Letterboxd Extras +"
+ *    button under Letterboxd's own "Clone this list" button.
+ * 2. On click, collects every film of the list (all pages), caches it and builds a CSV in the
+ *    Letterboxd import format (https://letterboxd.com/about/importing-data/).
+ * 3. Opens https://letterboxd.com/list/new/ in a new tab, where this same script picks up the
+ *    pending CSV and uploads it into the list importer. The user fills out the rest.
+ */
+/* eslint-disable */
+
+(function () {
+	const isChrome = typeof chrome !== "undefined" && typeof browser === "undefined";
+	const ext = isChrome ? chrome : browser;
+
+	const LOG_PREFIX = 'Letterboxd Extras + |';
+	const PENDING_KEY = 'lbxp-clone-pending';  // The CSV waiting to be uploaded on /list/new/
+	const CACHE_KEY = 'lbxp-clone-cache';      // Recently collected lists, keyed by list URL
+	const CACHE_MAX = 10;
+	const PENDING_MAX_AGE = 15 * 60 * 1000;    // Ignore pending clones older than 15 minutes
+	const PAGE_DELAY = 750;                    // Be nice to Letterboxd between page requests
+	const MAX_PAGES = 200;
+
+	const listPathPattern = /^\/([^\/]+)\/list\/([^\/]+)\//;
+	const reservedListSlugs = ['new'];
+
+	const path = window.location.pathname;
+	if (path.startsWith('/list/new')) {
+		initNewListPage();
+	} else {
+		const match = path.match(listPathPattern);
+		if (match != null && !reservedListSlugs.includes(match[2])) {
+			initListPage(`https://letterboxd.com/${match[1]}/list/${match[2]}/`);
+		}
+	}
+
+	// ======================================================================
+	// List page: add the button and collect the films
+	// ======================================================================
+
+	function initListPage(listUrl) {
+		addStyles();
+
+		// The sidebar can be rendered late, so retry for a little while
+		let attempts = 0;
+		const tryAdd = () => {
+			if (document.querySelector('.lbxp-clone-button') != null) return;
+			if (addCloneButton(listUrl)) return;
+			if (++attempts < 20) setTimeout(tryAdd, 500);
+		};
+		tryAdd();
+	}
+
+	function findLetterboxdCloneLink() {
+		const candidates = document.querySelectorAll('a, button');
+		for (const el of candidates) {
+			if (/^\s*clone\s+this\s+list\s*$/i.test(el.textContent)) return el;
+		}
+		return null;
+	}
+
+	function addCloneButton(listUrl) {
+		const cloneLink = findLetterboxdCloneLink();
+		if (cloneLink == null) return false;
+
+		const button = document.createElement('a');
+		button.href = '#';
+		button.className = cloneLink.className + ' lbxp-clone-button';
+		button.textContent = 'Clone with Letterboxd Extras +';
+		button.title = 'Copy every film in this list into a new list of your own';
+		button.addEventListener('click', event => {
+			event.preventDefault();
+			startClone(listUrl, button);
+		});
+
+		// Letterboxd's actions panel is a <ul> of <li>, so mirror that structure if present
+		const parentLi = cloneLink.closest('li');
+		if (parentLi != null) {
+			const li = document.createElement('li');
+			li.className = parentLi.className + ' lbxp-clone-item';
+			li.append(button);
+			parentLi.after(li);
+		} else {
+			cloneLink.after(button);
+		}
+		return true;
+	}
+
+	async function startClone(listUrl, button) {
+		if (button.dataset.busy === 'true') return;
+		button.dataset.busy = 'true';
+		const originalText = button.textContent;
+
+		try {
+			const setStatus = text => button.textContent = text;
+			setStatus('Collecting films…');
+
+			const list = await collectList(listUrl, setStatus);
+			if (list.films.length === 0) {
+				throw new Error('No films were found in this list.');
+			}
+
+			const csv = buildCsv(list.films);
+			await saveToCache(list, csv);
+			await ext.storage.local.set({
+				[PENDING_KEY]: {
+					sourceUrl: listUrl,
+					sourceTitle: list.title,
+					filmCount: list.films.length,
+					csv: csv,
+					createdAt: Date.now(),
+					importClicked: false
+				}
+			});
+
+			setStatus(`Opening new list (${list.films.length} films)…`);
+			await openNewListTab();
+			setStatus(`Cloned ${list.films.length} films ✓`);
+		} catch (error) {
+			console.error(LOG_PREFIX, error);
+			button.textContent = 'Clone failed — click to retry';
+			button.title = String(error && error.message ? error.message : error);
+			button.dataset.busy = 'false';
+			return;
+		}
+
+		setTimeout(() => {
+			button.textContent = originalText;
+			button.dataset.busy = 'false';
+		}, 5000);
+	}
+
+	async function openNewListTab() {
+		const url = 'https://letterboxd.com/list/new/';
+		try {
+			const res = await ext.runtime.sendMessage({ name: 'OPENTAB', url: url });
+			if (res && res.ok) return;
+		} catch (e) {
+			console.warn(LOG_PREFIX, 'Background tab open failed, falling back to window.open', e);
+		}
+		window.open(url, '_blank');
+	}
+
+	async function fetchDocument(url) {
+		const res = await fetch(url, { credentials: 'include' });
+		if (res.status !== 200) {
+			throw new Error(`Letterboxd returned ${res.status} for ${url}`);
+		}
+		const html = await res.text();
+		return new DOMParser().parseFromString(html, 'text/html');
+	}
+
+	async function collectList(listUrl, setStatus) {
+		const firstPage = await fetchDocument(listUrl);
+
+		const list = {
+			url: listUrl,
+			title: getListTitle(firstPage),
+			films: []
+		};
+		const seen = new Set();
+		collectFilmsFromPage(firstPage, list.films, seen);
+
+		const pageCount = Math.min(getPageCount(firstPage), MAX_PAGES);
+		for (let page = 2; page <= pageCount; page++) {
+			setStatus(`Collecting films… page ${page}/${pageCount}`);
+			await new Promise(r => setTimeout(r, PAGE_DELAY));
+			const doc = await fetchDocument(`${listUrl}page/${page}/`);
+			collectFilmsFromPage(doc, list.films, seen);
+		}
+
+		return list;
+	}
+
+	function getListTitle(doc) {
+		const meta = doc.querySelector('meta[property="og:title"]');
+		if (meta != null && meta.content) return meta.content.trim();
+
+		const titleElement = doc.querySelector('.list-title-intro .title-1, h1.title-1');
+		return titleElement != null ? titleElement.textContent.trim() : '';
+	}
+
+	function getPageCount(doc) {
+		const pages = doc.querySelectorAll('.paginate-pages li.paginate-page');
+		let max = 1;
+		pages.forEach(page => {
+			const n = parseInt(page.textContent.trim());
+			if (!isNaN(n) && n > max) max = n;
+		});
+		return max;
+	}
+
+	function collectFilmsFromPage(doc, films, seen) {
+		// Current markup: <li class="posteritem"><div class="react-component" data-item-slug=...>
+		// Older markup used data-film-slug on div.film-poster
+		let posters = doc.querySelectorAll('.poster-list .posteritem [data-item-slug]');
+		if (posters.length === 0) {
+			posters = doc.querySelectorAll('.poster-list [data-item-slug], .poster-list [data-film-slug]');
+		}
+
+		posters.forEach(poster => {
+			const slug = poster.getAttribute('data-item-slug') || poster.getAttribute('data-film-slug');
+			if (!slug || seen.has(slug)) return;
+			seen.add(slug);
+
+			const displayName = poster.getAttribute('data-item-full-display-name')
+				|| poster.getAttribute('data-item-name')
+				|| poster.getAttribute('data-film-name')
+				|| (poster.querySelector('img') && poster.querySelector('img').getAttribute('alt'))
+				|| '';
+			const { title, year } = splitTitleAndYear(displayName,
+				poster.getAttribute('data-item-release-year') || poster.getAttribute('data-film-release-year'));
+
+			films.push({
+				position: films.length + 1,
+				slug: slug,
+				title: title,
+				year: year,
+				uri: `https://letterboxd.com/film/${slug}/`
+			});
+		});
+	}
+
+	function splitTitleAndYear(name, yearAttr) {
+		name = (name || '').trim();
+		const match = name.match(/^(.*)\s\((\d{4})\)$/);
+		if (match != null) return { title: match[1].trim(), year: match[2] };
+		return { title: name, year: yearAttr || '' };
+	}
+
+	// ======================================================================
+	// CSV + cache
+	// ======================================================================
+
+	function csvField(value) {
+		value = value == null ? '' : String(value);
+		if (/[",\r\n]/.test(value)) {
+			return '"' + value.replace(/"/g, '""') + '"';
+		}
+		return value;
+	}
+
+	// Letterboxd import format: LetterboxdURI gives an exact match, Title/Year are only a fallback.
+	// Position keeps the original order (unknown columns are ignored by the importer).
+	function buildCsv(films) {
+		const rows = [['Position', 'Title', 'Year', 'LetterboxdURI']];
+		films.forEach(film => rows.push([film.position, film.title, film.year, film.uri]));
+		return rows.map(row => row.map(csvField).join(',')).join('\r\n') + '\r\n';
+	}
+
+	async function saveToCache(list, csv) {
+		const data = await ext.storage.local.get({ [CACHE_KEY]: {} });
+		const cache = data[CACHE_KEY] || {};
+		cache[list.url] = {
+			title: list.title,
+			films: list.films,
+			csv: csv,
+			collectedAt: Date.now()
+		};
+
+		// Keep only the most recent lists
+		const urls = Object.keys(cache).sort((a, b) => cache[b].collectedAt - cache[a].collectedAt);
+		urls.slice(CACHE_MAX).forEach(url => delete cache[url]);
+
+		await ext.storage.local.set({ [CACHE_KEY]: cache });
+	}
+
+	function csvFileName(pending) {
+		const slug = pending.sourceUrl.match(/\/list\/([^\/]+)\//);
+		return `${slug ? slug[1] : 'letterboxd-list'}.csv`;
+	}
+
+	// ======================================================================
+	// New list page: upload the pending CSV
+	// ======================================================================
+
+	async function initNewListPage() {
+		const data = await ext.storage.local.get(PENDING_KEY);
+		const pending = data[PENDING_KEY];
+		if (pending == null) return;
+
+		if (Date.now() - pending.createdAt > PENDING_MAX_AGE) {
+			await ext.storage.local.remove(PENDING_KEY);
+			return;
+		}
+
+		addStyles();
+		const banner = showBanner(`Cloning “${pending.sourceTitle || pending.sourceUrl}” (${pending.filmCount} films)… uploading CSV.`);
+
+		let input = await waitFor(findFileInput, 3000);
+
+		// No uploader on this page yet: Letterboxd shows it behind an "Import" link/button.
+		// Only click it once, in case it navigates (this script then continues on the next page).
+		if (input == null && !pending.importClicked) {
+			const importTrigger = findImportTrigger();
+			if (importTrigger != null) {
+				pending.importClicked = true;
+				await ext.storage.local.set({ [PENDING_KEY]: pending });
+				importTrigger.click();
+				input = await waitFor(findFileInput, 10000);
+			}
+		}
+
+		if (input == null) {
+			showFallback(banner, pending, 'Couldn’t find Letterboxd’s import button automatically.');
+			return;
+		}
+
+		try {
+			uploadCsv(input, pending);
+			await ext.storage.local.remove(PENDING_KEY);
+			setBannerText(banner, `Uploaded ${pending.filmCount} films from “${pending.sourceTitle}”. Review the matches, then add a name, tags and privacy.`);
+			addBannerClose(banner);
+		} catch (error) {
+			console.error(LOG_PREFIX, error);
+			showFallback(banner, pending, 'The automatic upload failed.');
+		}
+	}
+
+	function findFileInput() {
+		const inputs = document.querySelectorAll('input[type="file"]');
+		for (const input of inputs) {
+			const accept = (input.getAttribute('accept') || '').toLowerCase();
+			if (accept === '' || accept.includes('csv') || accept.includes('text') || accept.includes('zip')) {
+				return input;
+			}
+		}
+		return null;
+	}
+
+	function findImportTrigger() {
+		const candidates = document.querySelectorAll('a, button, label');
+		for (const el of candidates) {
+			if (el.closest('.lbxp-banner')) continue;
+			const text = el.textContent.trim();
+			const href = el.getAttribute('href') || '';
+			if (/^import\b/i.test(text) || /\/import\b/i.test(href)) return el;
+		}
+		return null;
+	}
+
+	function uploadCsv(input, pending) {
+		const file = new File([pending.csv], csvFileName(pending), { type: 'text/csv' });
+		const transfer = new DataTransfer();
+		transfer.items.add(file);
+		input.files = transfer.files;
+
+		input.dispatchEvent(new Event('input', { bubbles: true }));
+		input.dispatchEvent(new Event('change', { bubbles: true }));
+	}
+
+	function waitFor(finder, timeout) {
+		return new Promise(resolve => {
+			const found = finder();
+			if (found != null) return resolve(found);
+
+			const observer = new MutationObserver(() => {
+				const el = finder();
+				if (el != null) {
+					observer.disconnect();
+					clearTimeout(timer);
+					resolve(el);
+				}
+			});
+			observer.observe(document.documentElement, { childList: true, subtree: true });
+			const timer = setTimeout(() => {
+				observer.disconnect();
+				resolve(null);
+			}, timeout);
+		});
+	}
+
+	// ======================================================================
+	// UI
+	// ======================================================================
+
+	function showBanner(text) {
+		const banner = document.createElement('div');
+		banner.className = 'lbxp-banner';
+		const span = document.createElement('span');
+		span.className = 'lbxp-banner-text';
+		span.textContent = text;
+		banner.append(span);
+		document.body.append(banner);
+		return banner;
+	}
+
+	function setBannerText(banner, text) {
+		banner.querySelector('.lbxp-banner-text').textContent = text;
+	}
+
+	function addBannerClose(banner) {
+		const close = document.createElement('button');
+		close.className = 'lbxp-banner-button';
+		close.textContent = '✕';
+		close.title = 'Dismiss';
+		close.addEventListener('click', () => banner.remove());
+		banner.append(close);
+	}
+
+	// Manual fallback: let the user download the CSV and upload it themselves
+	function showFallback(banner, pending, reason) {
+		setBannerText(banner, `${reason} Download the CSV and use Letterboxd’s “Import” button on this page.`);
+
+		const download = document.createElement('button');
+		download.className = 'lbxp-banner-button';
+		download.textContent = 'Download CSV';
+		download.addEventListener('click', async () => {
+			const blob = new Blob([pending.csv], { type: 'text/csv' });
+			const a = document.createElement('a');
+			a.href = URL.createObjectURL(blob);
+			a.download = csvFileName(pending);
+			document.body.append(a);
+			a.click();
+			a.remove();
+			setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+			await ext.storage.local.remove(PENDING_KEY);
+		});
+		banner.append(download);
+		addBannerClose(banner);
+	}
+
+	function addStyles() {
+		if (document.getElementById('lbxp-clone-styles')) return;
+		const style = document.createElement('style');
+		style.id = 'lbxp-clone-styles';
+		style.textContent = `
+			.lbxp-clone-button[data-busy="true"] { cursor: progress; opacity: 0.8; }
+			.lbxp-banner {
+				position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+				z-index: 100000; max-width: min(640px, calc(100vw - 32px));
+				display: flex; align-items: center; gap: 12px;
+				padding: 12px 16px; border-radius: 6px;
+				background: #2c3440; color: #fff; border: 1px solid #00c030;
+				font-size: 14px; line-height: 1.4; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+			}
+			.lbxp-banner-text { flex: 1; }
+			.lbxp-banner-button {
+				background: #00c030; color: #fff; border: 0; border-radius: 3px;
+				padding: 6px 10px; cursor: pointer; font-weight: bold; white-space: nowrap;
+			}
+		`;
+		(document.head || document.documentElement).append(style);
+	}
+})();

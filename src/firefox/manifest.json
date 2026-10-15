@@ -1,6 +1,6 @@
 {
 	"manifest_version": 2,
-	"name": "Letterboxd Extras",
+	"name": "Letterboxd Extras +",
 	"description": "Display ratings from other film sites, and other nifty extras, directly on Letterboxd. Fully customizable.",
 	"version": "3.20.5",
 
@@ -9,7 +9,7 @@
 			"strict_min_version": "120.0"
 		},
 		"gecko": {
-			"id": "{9abb0ce4-6348-4119-b97a-3f8116351aca}",
+			"id": "letterboxd-extras-plus@bydiegoramirez",
 			"strict_min_version": "115.0",
 			"data_collection_permissions": {
 				"required": ["none"]
@@ -18,7 +18,7 @@
 	},	  
 	
 	"browser_action": {
-		"default_title": "Letterboxd Extras",
+		"default_title": "Letterboxd Extras +",
 		"default_popup": "options.html?type=action",
 		"default_icon": {
 			"16": "icon16.png",
@@ -81,6 +81,11 @@
 		{
 			"matches": [ "https://letterboxd.com/*" ],
 			"js": [ "polyfill.js", "additional.js", "letterboxd-extras.user.js" ],
+			"run_at": "document_end"
+		},
+		{
+			"matches": [ "https://letterboxd.com/*/list/*", "https://letterboxd.com/list/new/*" ],
+			"js": [ "clone-list.js" ],
 			"run_at": "document_end"
 		}
 	],

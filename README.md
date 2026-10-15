@@ -1,3 +1,19 @@
+# Letterboxd-Extras-Plus
+
+A fork of [Letterboxd Extras](https://github.com/duncanlang/Letterboxd-Extras) with extra features.
+
+### Clone with Letterboxd Extras +
+On any list page (e.g. `letterboxd.com/{user}/list/{slug}/`) a **Clone with Letterboxd Extras +** button appears under Letterboxd's own "Clone this list" button. Clicking it:
+1. Collects every film in the list (all pages) in the background and caches it in extension storage.
+2. Builds a CSV in the [Letterboxd import format](https://letterboxd.com/about/importing-data/) (`Position, Title, Year, LetterboxdURI`).
+3. Opens `letterboxd.com/list/new/` in a new tab and uploads the CSV into the list importer automatically.
+
+You then fill out the name, tags, description and privacy. If the automatic upload can't find the importer, a banner offers a **Download CSV** button so you can upload it by hand.
+
+Code: `src/common/clone-list.js` (content script) and the `OPENTAB` message in `src/common/background.js`.
+
+---
+
 # Letterboxd-Extras
 
 A browser add-on/extension that adds additional features to the movie tracking database site [Letterboxd](https://letterboxd.com/) including ratings from other sites, box office and budget, and more.
