@@ -336,12 +336,14 @@
 			if (importTrigger != null) {
 				pending.importClicked = true;
 				await ext.storage.local.set({ [PENDING_KEY]: pending });
+				console.log(LOG_PREFIX, 'Clicking import trigger:', importTrigger.outerHTML.slice(0, 300));
 				importTrigger.click();
 				input = await waitFor(findFileInput, 10000);
 			}
 		}
 
 		if (input == null) {
+			logImportDiagnostics();
 			showFallback(banner, pending, 'Couldn’t find Letterboxd’s import button automatically.');
 			return;
 		}
@@ -355,6 +357,19 @@
 			console.error(LOG_PREFIX, error);
 			showFallback(banner, pending, 'The automatic upload failed.');
 		}
+	}
+
+	// Printed when the upload fails, so the real markup of Letterboxd's importer can be reported back
+	function logImportDiagnostics() {
+		console.log(LOG_PREFIX, 'Import diagnostics for', window.location.href);
+		console.log(LOG_PREFIX, 'File inputs on page:', document.querySelectorAll('input[type="file"]').length);
+		document.querySelectorAll('a, button, label, input, [data-action], [class*="import"]').forEach(el => {
+			const text = (el.textContent || el.value || '').trim();
+			const attrs = Array.from(el.attributes).map(a => `${a.name}="${a.value}"`).join(' ');
+			if (/import|csv|upload/i.test(text + ' ' + attrs)) {
+				console.log(LOG_PREFIX, 'Candidate:', el.outerHTML.slice(0, 400));
+			}
+		});
 	}
 
 	function findFileInput() {
