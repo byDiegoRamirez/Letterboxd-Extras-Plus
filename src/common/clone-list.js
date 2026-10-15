@@ -148,8 +148,7 @@
 					sourceTitle: list.title,
 					filmCount: list.films.length,
 					csv: csv,
-					createdAt: Date.now(),
-					importClicked: false
+					createdAt: Date.now()
 				}
 			});
 
@@ -327,29 +326,48 @@
 		addStyles();
 		const banner = showBanner(`Cloning “${pending.sourceTitle || pending.sourceUrl}” (${pending.filmCount} films)… uploading CSV.`);
 
-		let input = await waitFor(findFileInput, 3000);
-
-		// No uploader on this page yet: Letterboxd shows it behind an "Import" link/button.
-		// Only click it once, in case it navigates (this script then continues on the next page).
-		if (input == null && !pending.importClicked) {
-			const importTrigger = findImportTrigger();
-			if (importTrigger != null) {
-				pending.importClicked = true;
-				await ext.storage.local.set({ [PENDING_KEY]: pending });
-				console.log(LOG_PREFIX, 'Clicking import trigger:', importTrigger.outerHTML.slice(0, 300));
-				importTrigger.click();
-				input = await waitFor(findFileInput, 10000);
-			}
+		// 1. An uploader that is already part of the page
+		let input = await waitFor(findFileInput, 1500);
+		if (input != null) {
+			return finishUpload(banner, pending, () => uploadCsv(input, pending));
 		}
 
-		if (input == null) {
+		// 2. Letterboxd's "Import" button (button.js-import-trigger) opens the file picker with an input that
+		//    is never added to the page. Intercept that picker in the page and give it the CSV instead.
+		const importTrigger = await waitFor(findImportTrigger, 5000);
+		if (importTrigger == null) {
 			logImportDiagnostics();
 			showFallback(banner, pending, 'Couldn’t find Letterboxd’s import button automatically.');
 			return;
 		}
 
+		const uploaded = new Promise(resolve => document.addEventListener('lbxp-csv-uploaded', () => resolve('intercepted'), { once: true }));
+		const armed = await armFileIntercept(pending);
+		console.log(LOG_PREFIX, 'File picker intercept armed:', armed, '| clicking', importTrigger.outerHTML.slice(0, 300));
+		importTrigger.click();
+
+		// Either the intercept fills the picker's input, or an uploader shows up in the page
+		const result = await Promise.race([
+			uploaded,
+			waitFor(findFileInput, 10000).then(el => el != null ? el : new Promise(r => setTimeout(() => r(null), 500)))
+		]);
+
+		if (result === 'intercepted') {
+			return finishUpload(banner, pending, () => {});
+		}
+		if (result != null) {
+			// Already filled by the intercept a moment earlier: don't upload twice
+			if (result.files != null && result.files.length > 0) return finishUpload(banner, pending, () => {});
+			return finishUpload(banner, pending, () => uploadCsv(result, pending));
+		}
+
+		logImportDiagnostics();
+		showFallback(banner, pending, 'Couldn’t upload the CSV into Letterboxd’s importer automatically.');
+	}
+
+	async function finishUpload(banner, pending, upload) {
 		try {
-			uploadCsv(input, pending);
+			upload();
 			await ext.storage.local.remove(PENDING_KEY);
 			setBannerText(banner, `Uploaded ${pending.filmCount} films from “${pending.sourceTitle}”. Review the matches, then add a name, tags and privacy.`);
 			addBannerClose(banner);
@@ -357,6 +375,39 @@
 			console.error(LOG_PREFIX, error);
 			showFallback(banner, pending, 'The automatic upload failed.');
 		}
+	}
+
+	// Installs the file picker intercept in the page itself (see armFileIntercept in background.js)
+	async function armFileIntercept(pending) {
+		try {
+			const res = await ext.runtime.sendMessage({ name: 'ARMFILEINTERCEPT', csv: pending.csv, filename: csvFileName(pending) });
+			if (res && res.ok) return 'background';
+			console.warn(LOG_PREFIX, 'Background intercept failed:', res && res.error);
+		} catch (e) {
+			console.warn(LOG_PREFIX, 'Background intercept failed:', e);
+		}
+
+		// Firefox fallback: patch the page's prototype through the content script's Xray wrappers
+		if (typeof exportFunction === 'function' && window.wrappedJSObject) {
+			const proto = window.wrappedJSObject.HTMLInputElement.prototype;
+			let armedXray = true;
+			setTimeout(() => armedXray = false, 20000);
+			['click', 'showPicker'].forEach(method => {
+				const original = proto[method];
+				if (typeof original !== 'function') return;
+				exportFunction(function () {
+					if (armedXray && this.type === 'file') {
+						armedXray = false;
+						uploadCsv(this, pending);
+						document.dispatchEvent(new CustomEvent('lbxp-csv-uploaded'));
+						return;
+					}
+					return original.apply(this, arguments);
+				}, proto, { defineAs: method });
+			});
+			return 'xray';
+		}
+		return false;
 	}
 
 	// Printed when the upload fails, so the real markup of Letterboxd's importer can be reported back
@@ -375,15 +426,18 @@
 	function findFileInput() {
 		const inputs = document.querySelectorAll('input[type="file"]');
 		for (const input of inputs) {
+			// Skip image-only uploaders (avatars, backdrops); anything else may be the CSV importer
 			const accept = (input.getAttribute('accept') || '').toLowerCase();
-			if (accept === '' || accept.includes('csv') || accept.includes('text') || accept.includes('zip')) {
-				return input;
-			}
+			const imageOnly = accept !== '' && accept.split(',').every(a => a.trim().startsWith('image/'));
+			if (!imageOnly) return input;
 		}
 		return null;
 	}
 
 	function findImportTrigger() {
+		const known = document.querySelector('.js-import-trigger');
+		if (known != null) return known;
+
 		const candidates = document.querySelectorAll('a, button, label');
 		for (const el of candidates) {
 			if (el.closest('.lbxp-banner')) continue;
